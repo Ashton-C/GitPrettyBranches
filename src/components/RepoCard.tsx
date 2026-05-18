@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
   GitHubError,
   getBranches,
@@ -103,14 +103,26 @@ export function RepoCard({ repo, owner, autoExpand = false }: Props) {
     }
   }, [owner, repo.default_branch, repo.name, token]);
 
+  const cardRef = useRef<HTMLDivElement>(null);
+
   function toggle() {
     const next = !expanded;
     setExpanded(next);
     if (next && state.kind === "idle") load();
+    if (next) {
+      // Scroll the card to the top of the viewport so the graph area below
+      // gets a full screen to live in.
+      requestAnimationFrame(() => {
+        cardRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    }
   }
 
   return (
-    <div className="rounded-lg border border-border bg-bg-soft overflow-hidden">
+    <div
+      ref={cardRef}
+      className="scroll-mt-20 rounded-lg border border-border bg-bg-soft overflow-hidden"
+    >
       <button
         onClick={toggle}
         className="flex w-full items-start gap-3 px-4 py-3 text-left hover:bg-bg-softer transition-colors"
@@ -179,7 +191,7 @@ export function RepoCard({ repo, owner, autoExpand = false }: Props) {
             </div>
           )}
           {state.kind === "ready" && (
-            <div className="space-y-3">
+            <div className="flex flex-col gap-3">
               <div className="flex flex-wrap items-center justify-between gap-3">
                 <div className="text-xs text-text-muted">
                   {state.branchCount} branch{state.branchCount === 1 ? "" : "es"}
@@ -197,7 +209,11 @@ export function RepoCard({ repo, owner, autoExpand = false }: Props) {
                 </button>
               </div>
               <Legend branchTips={state.graph.branchTips} />
-              <BranchGraph graph={state.graph} repoUrl={repo.html_url} />
+              {/* Reserve a viewport-sized area so the whole tree fits on one
+                  screen. The SVG inside auto-fits via its viewBox. */}
+              <div className="h-[calc(100vh-260px)] min-h-[420px] w-full">
+                <BranchGraph graph={state.graph} repoUrl={repo.html_url} />
+              </div>
             </div>
           )}
         </div>
