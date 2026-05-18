@@ -8,17 +8,16 @@ type Props = {
   repoUrl: string;
 };
 
-// Natural geometry — these are SVG user units. The viewBox auto-scales the
-// whole thing to fill the parent container, so absolute pixel sizes don't
-// really matter; ratios do.
-const ROW_HEIGHT = 28;
-const LANE_WIDTH = 22;
-const LEFT_PAD = 20;
-const GRAPH_RIGHT_PAD = 16;
-const TEXT_COL_WIDTH = 520;
+// Natural geometry — SVG user units. The viewBox auto-scales so absolute
+// values matter mostly for ratios. Sideways layout: time flows left → right
+// (newest on the left, oldest on the right), lanes stack top → bottom.
+const COL_WIDTH = 28;
+const LANE_HEIGHT = 22;
+const LEFT_PAD = 40;
+const RIGHT_PAD = 40;
+const TOP_PAD = 56; // extra headroom for branch chips above tip nodes
+const BOTTOM_PAD = 24;
 const NODE_RADIUS = 6;
-const TOP_PAD = 16;
-const BOTTOM_PAD = 16;
 
 export function BranchGraph({ graph, repoUrl }: Props) {
   const { commits, edges, branchTips, laneCount } = graph;
@@ -26,12 +25,12 @@ export function BranchGraph({ graph, repoUrl }: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const svgRef = useRef<SVGSVGElement>(null);
 
-  const graphPixelWidth = LEFT_PAD + laneCount * LANE_WIDTH + GRAPH_RIGHT_PAD;
-  const naturalWidth = graphPixelWidth + TEXT_COL_WIDTH;
+  const naturalWidth =
+    LEFT_PAD + Math.max(1, commits.length) * COL_WIDTH + RIGHT_PAD;
   const naturalHeight =
-    TOP_PAD + Math.max(1, commits.length) * ROW_HEIGHT + BOTTOM_PAD;
+    TOP_PAD + Math.max(1, laneCount) * LANE_HEIGHT + BOTTOM_PAD;
 
-  // viewBox is the source of truth for pan + zoom.
+  // viewBox = source of truth for pan + zoom.
   const [view, setView] = useState({
     x: 0,
     y: 0,
@@ -39,40 +38,51 @@ export function BranchGraph({ graph, repoUrl }: Props) {
     h: naturalHeight,
   });
 
-  // Reset viewBox whenever the underlying graph changes (different repo
-  // expanded, refresh, etc.).
   useEffect(() => {
     setView({ x: 0, y: 0, w: naturalWidth, h: naturalHeight });
   }, [naturalWidth, naturalHeight]);
 
-  function laneX(lane: number) {
-    return LEFT_PAD + lane * LANE_WIDTH;
+  function commitX(row: number) {
+    return LEFT_PAD + row * COL_WIDTH;
   }
-  function rowY(row: number) {
-    return TOP_PAD + ROW_HEIGHT / 2 + row * ROW_HEIGHT;
+  function laneY(lane: number) {
+    return TOP_PAD + lane * LANE_HEIGHT;
   }
 
-  // Group branch tips by SHA so multiple branches at the same commit stack.
-  const tipsBySha = useMemo(() => {
-    const m = new Map<string, typeof branchTips>();
+  // Map: row index → list of branch tips that end at that commit. A branch's
+  // "first node" is its tip — the most recent commit on it.
+  const tipsByRow = useMemo(() => {
+    const shaToRow = new Map<string, { lane: number; row: number }>();
+    for (const c of commits) shaToRow.set(c.sha, { lane: c.lane, row: c.row });
+    const m = new Map<
+      number,
+      { name: string; color: string; lane: number; row: number }[]
+    >();
     for (const t of branchTips) {
-      const arr = m.get(t.sha) ?? [];
-      arr.push(t);
-      m.set(t.sha, arr);
+      const pos = shaToRow.get(t.sha);
+      if (!pos) continue;
+      const arr = m.get(pos.row) ?? [];
+      arr.push({ name: t.name, color: t.color, lane: pos.lane, row: pos.row });
+      m.set(pos.row, arr);
     }
     return m;
-  }, [branchTips]);
+  }, [branchTips, commits]);
 
-  // Hover state for tooltip + row highlight.
-  const [hoverIdx, setHoverIdx] = useState<number | null>(null);
-  const [tooltip, setTooltip] = useState<{
-    x: number;
-    y: number;
-    idx: number;
-  } | null>(null);
+  // For fast hit-testing on hover/click: commits indexed by row, then by lane.
+  const commitsByRow = useMemo(() => {
+    const m = new Map<number, GraphData["commits"]>();
+    for (const c of commits) {
+      const arr = m.get(c.row) ?? [];
+      arr.push(c);
+      m.set(c.row, arr);
+    }
+    return m;
+  }, [commits]);
 
-  // Convert client (mouse) coordinates → SVG user units, taking the current
-  // viewBox into account. This is how pan/zoom translate into commit picking.
+  const [hoveredSha, setHoveredSha] = useState<string | null>(null);
+  const [tooltip, setTooltip] = useState<{ x: number; y: number; sha: string } | null>(null);
+  const [selectedSha, setSelectedSha] = useState<string | null>(null);
+
   function clientToSvg(clientX: number, clientY: number) {
     const svg = svgRef.current;
     if (!svg) return { x: 0, y: 0 };
@@ -82,68 +92,74 @@ export function BranchGraph({ graph, repoUrl }: Props) {
     return { x: view.x + fx * view.w, y: view.y + fy * view.h };
   }
 
+  function pickCommit(clientX: number, clientY: number) {
+    const { x, y } = clientToSvg(clientX, clientY);
+    const row = Math.round((x - LEFT_PAD) / COL_WIDTH);
+    const candidates = commitsByRow.get(row);
+    if (!candidates || candidates.length === 0) return null;
+    let best: GraphData["commits"][number] | null = null;
+    let bestDist = Infinity;
+    for (const c of candidates) {
+      const dx = x - commitX(c.row);
+      const dy = y - laneY(c.lane);
+      const d = Math.hypot(dx, dy);
+      if (d < bestDist) {
+        bestDist = d;
+        best = c;
+      }
+    }
+    // Pick threshold scales with current zoom so hit area stays comfortable.
+    const threshold = Math.max(NODE_RADIUS * 2, (COL_WIDTH + LANE_HEIGHT) / 3);
+    return bestDist <= threshold ? best : null;
+  }
+
   function handleMouseMove(e: React.MouseEvent) {
-    if (isDragging.current) return;
-    const { y } = clientToSvg(e.clientX, e.clientY);
-    const idx = Math.floor((y - TOP_PAD) / ROW_HEIGHT);
-    if (idx >= 0 && idx < commits.length) {
-      setHoverIdx(idx);
-      setTooltip({
-        x: e.clientX,
-        y: e.clientY,
-        idx,
-      });
+    if (isDragging.current) {
+      handleDrag(e);
+      return;
+    }
+    const c = pickCommit(e.clientX, e.clientY);
+    if (c) {
+      setHoveredSha(c.sha);
+      setTooltip({ x: e.clientX, y: e.clientY, sha: c.sha });
     } else {
-      setHoverIdx(null);
+      setHoveredSha(null);
       setTooltip(null);
     }
   }
 
-  function handleMouseLeave() {
-    setHoverIdx(null);
-    setTooltip(null);
+  function handleClick(e: React.MouseEvent) {
+    // Suppress clicks that were really drags.
+    if (dragMoved.current) return;
+    const c = pickCommit(e.clientX, e.clientY);
+    if (c) {
+      setSelectedSha((cur) => (cur === c.sha ? null : c.sha));
+    } else {
+      setSelectedSha(null);
+    }
   }
 
-  // Wheel = zoom around the cursor; preserves the SVG point under the mouse.
   function handleWheel(e: React.WheelEvent) {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 0.9 : 1.1;
     const { x: mx, y: my } = clientToSvg(e.clientX, e.clientY);
     const newW = clamp(view.w * factor, naturalWidth / 20, naturalWidth * 5);
     const newH = clamp(view.h * factor, naturalHeight / 20, naturalHeight * 5);
-    // Keep cursor pinned to same point in user-units.
     const fx = (mx - view.x) / view.w;
     const fy = (my - view.y) / view.h;
-    setView({
-      x: mx - fx * newW,
-      y: my - fy * newH,
-      w: newW,
-      h: newH,
-    });
+    setView({ x: mx - fx * newW, y: my - fy * newH, w: newW, h: newH });
   }
 
-  // Drag to pan.
   const isDragging = useRef(false);
-  const dragStart = useRef<{ x: number; y: number; vx: number; vy: number }>({
-    x: 0,
-    y: 0,
-    vx: 0,
-    vy: 0,
-  });
+  const dragMoved = useRef(false);
+  const dragStart = useRef({ x: 0, y: 0, vx: 0, vy: 0 });
 
   function handleMouseDown(e: React.MouseEvent) {
     if (e.button !== 0) return;
-    // Don't start a drag on top of a clickable element (commit row anchor).
-    const target = e.target as Element;
-    if (target.closest("a")) return;
     isDragging.current = true;
-    dragStart.current = {
-      x: e.clientX,
-      y: e.clientY,
-      vx: view.x,
-      vy: view.y,
-    };
-    setHoverIdx(null);
+    dragMoved.current = false;
+    dragStart.current = { x: e.clientX, y: e.clientY, vx: view.x, vy: view.y };
+    setHoveredSha(null);
     setTooltip(null);
   }
 
@@ -155,11 +171,12 @@ export function BranchGraph({ graph, repoUrl }: Props) {
     if (!isDragging.current) return;
     const svg = svgRef.current;
     if (!svg) return;
+    const dxRaw = e.clientX - dragStart.current.x;
+    const dyRaw = e.clientY - dragStart.current.y;
+    if (Math.hypot(dxRaw, dyRaw) > 3) dragMoved.current = true;
     const rect = svg.getBoundingClientRect();
-    const dx =
-      ((e.clientX - dragStart.current.x) / rect.width) * view.w;
-    const dy =
-      ((e.clientY - dragStart.current.y) / rect.height) * view.h;
+    const dx = (dxRaw / rect.width) * view.w;
+    const dy = (dyRaw / rect.height) * view.h;
     setView((v) => ({ ...v, x: dragStart.current.vx - dx, y: dragStart.current.vy - dy }));
   }
 
@@ -175,7 +192,6 @@ export function BranchGraph({ graph, repoUrl }: Props) {
     setView({ x: cx - newW / 2, y: cy - newH / 2, w: newW, h: newH });
   }
 
-  // Empty-graph guard.
   if (commits.length === 0) {
     return (
       <div className="flex h-full items-center justify-center rounded-md border border-border bg-bg-soft p-4 text-sm text-text-muted">
@@ -184,9 +200,11 @@ export function BranchGraph({ graph, repoUrl }: Props) {
     );
   }
 
-  // Approximate "fit %" indicator for the user — 100% means the natural
-  // viewBox is shown unmodified.
   const fitPct = Math.round((naturalWidth / view.w) * 100);
+  const selectedCommit =
+    selectedSha != null ? commits.find((c) => c.sha === selectedSha) ?? null : null;
+  const hoveredCommit =
+    hoveredSha != null ? commits.find((c) => c.sha === hoveredSha) ?? null : null;
 
   return (
     <div
@@ -200,39 +218,26 @@ export function BranchGraph({ graph, repoUrl }: Props) {
         className="block h-full w-full select-none"
         onWheel={handleWheel}
         onMouseDown={handleMouseDown}
-        onMouseMove={(e) => {
-          handleDrag(e);
-          handleMouseMove(e);
-        }}
+        onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
         onMouseLeave={() => {
           handleMouseUp();
-          handleMouseLeave();
+          setHoveredSha(null);
+          setTooltip(null);
         }}
-        style={{ cursor: isDragging.current ? "grabbing" : "grab" }}
+        onClick={handleClick}
+        style={{ cursor: isDragging.current ? "grabbing" : "default" }}
       >
-        {/* Row hover highlight */}
-        {hoverIdx !== null && (
-          <rect
-            x={view.x}
-            y={TOP_PAD + hoverIdx * ROW_HEIGHT}
-            width={view.w}
-            height={ROW_HEIGHT}
-            fill="#ffffff"
-            opacity={0.04}
-          />
-        )}
-
-        {/* Edges — drawn first so nodes/text sit on top */}
+        {/* Edges first so nodes sit on top */}
         {edges.map((e, i) => {
-          const x1 = laneX(e.fromLane);
-          const y1 = rowY(e.fromRow);
-          const x2 = laneX(e.toLane);
-          const y2 = rowY(e.toRow);
+          const x1 = commitX(e.fromRow);
+          const y1 = laneY(e.fromLane);
+          const x2 = commitX(e.toRow);
+          const y2 = laneY(e.toLane);
           const d =
             e.fromLane === e.toLane
               ? `M ${x1} ${y1} L ${x2} ${y2}`
-              : curvePath(x1, y1, x2, y2);
+              : sidewaysCurve(x1, y1, x2, y2);
           return (
             <path
               key={i}
@@ -245,70 +250,64 @@ export function BranchGraph({ graph, repoUrl }: Props) {
           );
         })}
 
-        {/* Commit text + branch chips, all in SVG so they scale with viewBox */}
-        {commits.map((c, idx) => {
-          const tips = tipsBySha.get(c.sha) ?? [];
-          const textX = graphPixelWidth;
-          const y = rowY(c.row);
+        {/* Branch chips at the tip (first node) of each branch */}
+        {[...tipsByRow.entries()].map(([row, tips]) => (
+          <g key={`tips-${row}`}>
+            {tips.map((t, i) => {
+              const node = { x: commitX(t.row), y: laneY(t.lane) };
+              const w = chipWidth(t.name);
+              // Stack chips upward when multiple branches share a tip.
+              const chipY = node.y - NODE_RADIUS - 10 - i * 20;
+              const chipX = node.x - w / 2;
+              return (
+                <g key={t.name}>
+                  {/* Connector line from chip to node */}
+                  <line
+                    x1={node.x}
+                    y1={chipY + 16}
+                    x2={node.x}
+                    y2={node.y - NODE_RADIUS}
+                    stroke={hexToRgba(t.color, 0.55)}
+                    strokeWidth={1.5}
+                    vectorEffect="non-scaling-stroke"
+                  />
+                  <ChipSvg x={chipX} y={chipY} label={t.name} color={t.color} />
+                </g>
+              );
+            })}
+          </g>
+        ))}
+
+        {/* Commit nodes */}
+        {commits.map((c) => {
+          const isHover = c.sha === hoveredSha;
+          const isSelected = c.sha === selectedSha;
           return (
             <g key={c.sha}>
-              {/* Branch tip chips */}
-              {tips.map((t, ti) => {
-                const chipX =
-                  textX +
-                  tips
-                    .slice(0, ti)
-                    .reduce((acc, tt) => acc + chipWidth(tt.name) + 6, 0);
-                return (
-                  <ChipSvg
-                    key={t.name}
-                    x={chipX}
-                    y={y}
-                    label={t.name}
-                    color={t.color}
-                  />
-                );
-              })}
-              {/* Commit message — clicking takes you to GitHub */}
-              <a
-                href={`${repoUrl}/commit/${c.sha}`}
-                target="_blank"
-                rel="noreferrer"
-                onClick={(e) => e.stopPropagation()}
-              >
-                <text
-                  x={
-                    textX +
-                    tips.reduce(
-                      (acc, t) => acc + chipWidth(t.name) + 6,
-                      tips.length > 0 ? 4 : 0,
-                    )
-                  }
-                  y={y + 4}
-                  fontSize={13}
-                  fontFamily="ui-monospace, SFMono-Regular, Menlo, monospace"
-                  fill={hoverIdx === idx ? "#e6edf3" : "#c9d1d9"}
-                  className="cursor-pointer"
-                >
-                  {truncate(c.message || "(no message)", 64)}
-                </text>
-              </a>
+              {isSelected && (
+                <circle
+                  cx={commitX(c.row)}
+                  cy={laneY(c.lane)}
+                  r={NODE_RADIUS + 5}
+                  fill="none"
+                  stroke={c.color}
+                  strokeWidth={2}
+                  opacity={0.7}
+                  vectorEffect="non-scaling-stroke"
+                />
+              )}
+              <circle
+                cx={commitX(c.row)}
+                cy={laneY(c.lane)}
+                r={isHover || isSelected ? NODE_RADIUS + 1 : NODE_RADIUS}
+                fill={c.color}
+                stroke="#0d1117"
+                strokeWidth={2}
+                style={{ cursor: "pointer" }}
+              />
             </g>
           );
         })}
-
-        {/* Commit nodes on top of everything */}
-        {commits.map((c) => (
-          <circle
-            key={c.sha}
-            cx={laneX(c.lane)}
-            cy={rowY(c.row)}
-            r={NODE_RADIUS}
-            fill={c.color}
-            stroke="#0d1117"
-            strokeWidth={2}
-          />
-        ))}
       </svg>
 
       {/* Zoom + fit controls */}
@@ -340,59 +339,107 @@ export function BranchGraph({ graph, repoUrl }: Props) {
         </button>
       </div>
 
-      {/* Tooltip for the hovered commit */}
-      {tooltip && (
-        <CommitTooltip
+      <div className="absolute bottom-3 left-3 z-10 rounded-md border border-border bg-bg/90 px-2 py-1 text-[10px] text-text-muted backdrop-blur">
+        scroll = zoom · drag = pan · click commit for details
+      </div>
+
+      {/* Hover tooltip */}
+      {tooltip && hoveredCommit && !selectedCommit && (
+        <FloatingCard
           clientX={tooltip.x}
           clientY={tooltip.y}
           containerRef={containerRef}
-          commit={commits[tooltip.idx]}
-        />
+        >
+          <div className="font-mono text-text-muted">
+            {hoveredCommit.sha.slice(0, 7)}
+          </div>
+          <div className="mt-0.5 line-clamp-2 text-text">
+            {hoveredCommit.message}
+          </div>
+        </FloatingCard>
       )}
 
-      <div className="absolute bottom-3 left-3 z-10 rounded-md border border-border bg-bg/90 px-2 py-1 text-[10px] text-text-muted backdrop-blur">
-        scroll = zoom · drag = pan · click commit to open
-      </div>
+      {/* Click-to-pin detail panel */}
+      {selectedCommit && (
+        <div className="absolute right-3 top-3 z-20 w-80 rounded-md border border-border bg-bg/95 p-3 text-xs shadow-xl backdrop-blur">
+          <div className="flex items-start justify-between gap-2">
+            <span
+              className="inline-flex items-center gap-1.5 font-mono"
+              style={{ color: selectedCommit.color }}
+            >
+              <span
+                className="inline-block h-2 w-2 rounded-full"
+                style={{ background: selectedCommit.color }}
+              />
+              {selectedCommit.sha.slice(0, 7)}
+            </span>
+            <button
+              onClick={() => setSelectedSha(null)}
+              className="text-text-muted hover:text-text"
+              aria-label="Close"
+            >
+              ✕
+            </button>
+          </div>
+          <div className="mt-2 whitespace-pre-wrap text-text">
+            {selectedCommit.message}
+          </div>
+          <div className="mt-2 text-text-muted">
+            {selectedCommit.authorLogin || selectedCommit.authorName} ·{" "}
+            {formatDate(selectedCommit.date)}
+          </div>
+          {selectedCommit.branches.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {selectedCommit.branches.slice(0, 6).map((b) => (
+                <span
+                  key={b}
+                  className="rounded border border-border bg-bg-soft px-1.5 py-0.5 font-mono"
+                >
+                  {b}
+                </span>
+              ))}
+              {selectedCommit.branches.length > 6 && (
+                <span className="text-text-muted">
+                  +{selectedCommit.branches.length - 6} more
+                </span>
+              )}
+            </div>
+          )}
+          <a
+            href={`${repoUrl}/commit/${selectedCommit.sha}`}
+            target="_blank"
+            rel="noreferrer"
+            className="mt-3 inline-block text-accent hover:underline"
+          >
+            View on GitHub ↗
+          </a>
+        </div>
+      )}
     </div>
   );
 }
 
-function CommitTooltip({
+function FloatingCard({
   clientX,
   clientY,
   containerRef,
-  commit,
+  children,
 }: {
   clientX: number;
   clientY: number;
   containerRef: React.RefObject<HTMLDivElement | null>;
-  commit: ReturnType<() => GraphData["commits"][number]>;
+  children: React.ReactNode;
 }) {
   const rect = containerRef.current?.getBoundingClientRect();
   if (!rect) return null;
-  // Keep tooltip inside the container bounds.
-  const localX = Math.min(clientX - rect.left + 12, rect.width - 320);
-  const localY = Math.min(clientY - rect.top + 12, rect.height - 110);
+  const localX = Math.min(clientX - rect.left + 12, rect.width - 280);
+  const localY = Math.min(clientY - rect.top + 12, rect.height - 80);
   return (
     <div
-      className="pointer-events-none absolute z-20 max-w-[320px] rounded-md border border-border bg-bg/95 px-3 py-2 text-xs shadow-lg backdrop-blur"
+      className="pointer-events-none absolute z-20 max-w-[260px] rounded-md border border-border bg-bg/95 px-3 py-2 text-xs shadow-lg backdrop-blur"
       style={{ left: Math.max(8, localX), top: Math.max(8, localY) }}
     >
-      <div className="font-mono text-text-muted">
-        {commit.sha.slice(0, 7)}
-      </div>
-      <div className="mt-0.5 text-text">{commit.message}</div>
-      <div className="mt-1 text-text-muted">
-        {commit.authorLogin || commit.authorName} · {formatDate(commit.date)}
-      </div>
-      {commit.branches.length > 0 && (
-        <div className="mt-1 text-text-muted">
-          on {commit.branches.slice(0, 4).join(", ")}
-          {commit.branches.length > 4
-            ? ` +${commit.branches.length - 4}`
-            : ""}
-        </div>
-      )}
+      {children}
     </div>
   );
 }
@@ -411,14 +458,14 @@ function ChipSvg({
   const w = chipWidth(label);
   const h = 16;
   return (
-    <g transform={`translate(${x}, ${y - h / 2})`}>
+    <g transform={`translate(${x}, ${y})`}>
       <rect
         rx={8}
         ry={8}
         width={w}
         height={h}
         fill={hexToRgba(color, 0.18)}
-        stroke={hexToRgba(color, 0.5)}
+        stroke={hexToRgba(color, 0.55)}
       />
       <circle cx={9} cy={h / 2} r={3} fill={color} />
       <text
@@ -435,13 +482,14 @@ function ChipSvg({
 }
 
 function chipWidth(label: string) {
-  // Approximate width: 6px per char (monospace 10px) + 24px padding.
   return Math.min(label.length, 28) * 6 + 24;
 }
 
-function curvePath(x1: number, y1: number, x2: number, y2: number) {
-  const midY = (y1 + y2) / 2;
-  return `M ${x1} ${y1} C ${x1} ${midY}, ${x2} ${midY}, ${x2} ${y2}`;
+function sidewaysCurve(x1: number, y1: number, x2: number, y2: number) {
+  // Horizontal S: control points pulled along the X axis so the bend happens
+  // mid-column instead of mid-row.
+  const midX = (x1 + x2) / 2;
+  return `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
 }
 
 function clamp(n: number, min: number, max: number) {
@@ -454,10 +502,6 @@ function hexToRgba(hex: string, alpha: number) {
   const g = parseInt(clean.slice(2, 4), 16);
   const b = parseInt(clean.slice(4, 6), 16);
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-function truncate(s: string, n: number) {
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
 function formatDate(iso: string) {
