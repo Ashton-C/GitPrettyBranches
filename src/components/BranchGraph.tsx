@@ -9,8 +9,9 @@ type Props = {
 };
 
 // Natural geometry — SVG user units. The viewBox auto-scales so absolute
-// values matter mostly for ratios. Sideways layout: time flows left → right
-// (newest on the left, oldest on the right), lanes stack top → bottom.
+// values matter mostly for ratios. Sideways layout with a left → right time
+// axis: oldest on the left, newest (branch tips) on the right. Lanes stack
+// top → bottom.
 const COL_WIDTH = 28;
 const LANE_HEIGHT = 22;
 const LEFT_PAD = 40;
@@ -42,8 +43,11 @@ export function BranchGraph({ graph, repoUrl }: Props) {
     setView({ x: 0, y: 0, w: naturalWidth, h: naturalHeight });
   }, [naturalWidth, naturalHeight]);
 
+  // Rows come in newest-first (row 0 = HEAD). Flip the visual mapping so the
+  // newest commit lands on the right edge — standard left-to-right timeline.
+  const maxRow = Math.max(0, commits.length - 1);
   function commitX(row: number) {
-    return LEFT_PAD + row * COL_WIDTH;
+    return LEFT_PAD + (maxRow - row) * COL_WIDTH;
   }
   function laneY(lane: number) {
     return TOP_PAD + lane * LANE_HEIGHT;
@@ -81,20 +85,35 @@ export function BranchGraph({ graph, repoUrl }: Props) {
 
   const [hoveredSha, setHoveredSha] = useState<string | null>(null);
   const [tooltip, setTooltip] = useState<{ x: number; y: number; sha: string } | null>(null);
-  const [selectedSha, setSelectedSha] = useState<string | null>(null);
 
-  function clientToSvg(clientX: number, clientY: number) {
+  // Keep latest view in a ref so the natively-attached wheel listener (which
+  // is registered once with passive:false) can always read fresh state.
+  const viewRef = useRef(view);
+  useEffect(() => {
+    viewRef.current = view;
+  }, [view]);
+
+  function clientToSvgUsing(
+    v: { x: number; y: number; w: number; h: number },
+    clientX: number,
+    clientY: number,
+  ) {
     const svg = svgRef.current;
     if (!svg) return { x: 0, y: 0 };
     const rect = svg.getBoundingClientRect();
     const fx = (clientX - rect.left) / rect.width;
     const fy = (clientY - rect.top) / rect.height;
-    return { x: view.x + fx * view.w, y: view.y + fy * view.h };
+    return { x: v.x + fx * v.w, y: v.y + fy * v.h };
+  }
+
+  function clientToSvg(clientX: number, clientY: number) {
+    return clientToSvgUsing(view, clientX, clientY);
   }
 
   function pickCommit(clientX: number, clientY: number) {
     const { x, y } = clientToSvg(clientX, clientY);
-    const row = Math.round((x - LEFT_PAD) / COL_WIDTH);
+    // Inverted axis: x grows with (maxRow - row), so row = maxRow - col.
+    const row = Math.round(maxRow - (x - LEFT_PAD) / COL_WIDTH);
     const candidates = commitsByRow.get(row);
     if (!candidates || candidates.length === 0) return null;
     let best: GraphData["commits"][number] | null = null;
@@ -108,7 +127,6 @@ export function BranchGraph({ graph, repoUrl }: Props) {
         best = c;
       }
     }
-    // Pick threshold scales with current zoom so hit area stays comfortable.
     const threshold = Math.max(NODE_RADIUS * 2, (COL_WIDTH + LANE_HEIGHT) / 3);
     return bestDist <= threshold ? best : null;
   }
@@ -129,26 +147,39 @@ export function BranchGraph({ graph, repoUrl }: Props) {
   }
 
   function handleClick(e: React.MouseEvent) {
-    // Suppress clicks that were really drags.
     if (dragMoved.current) return;
     const c = pickCommit(e.clientX, e.clientY);
-    if (c) {
-      setSelectedSha((cur) => (cur === c.sha ? null : c.sha));
-    } else {
-      setSelectedSha(null);
-    }
+    if (!c) return;
+    // Open GitHub in a new tab. No modal — the tree stays clean.
+    window.open(`${repoUrl}/commit/${c.sha}`, "_blank", "noopener,noreferrer");
   }
 
-  function handleWheel(e: React.WheelEvent) {
-    e.preventDefault();
-    const factor = e.deltaY < 0 ? 0.9 : 1.1;
-    const { x: mx, y: my } = clientToSvg(e.clientX, e.clientY);
-    const newW = clamp(view.w * factor, naturalWidth / 20, naturalWidth * 5);
-    const newH = clamp(view.h * factor, naturalHeight / 20, naturalHeight * 5);
-    const fx = (mx - view.x) / view.w;
-    const fy = (my - view.y) / view.h;
-    setView({ x: mx - fx * newW, y: my - fy * newH, w: newW, h: newH });
-  }
+  // Wheel must be non-passive so we can preventDefault and stop the page from
+  // scrolling while the cursor is over the graph. React's synthetic onWheel
+  // is passive by default, so we attach manually.
+  useEffect(() => {
+    const svg = svgRef.current;
+    if (!svg) return;
+    function onWheel(e: WheelEvent) {
+      e.preventDefault();
+      const v = viewRef.current;
+      const factor = e.deltaY < 0 ? 0.9 : 1.1;
+      const { x: mx, y: my } = clientToSvgUsing(v, e.clientX, e.clientY);
+      const newW = clamp(v.w * factor, naturalWidth / 20, naturalWidth * 5);
+      const newH = clamp(v.h * factor, naturalHeight / 20, naturalHeight * 5);
+      const fx = (mx - v.x) / v.w;
+      const fy = (my - v.y) / v.h;
+      setView({
+        x: mx - fx * newW,
+        y: my - fy * newH,
+        w: newW,
+        h: newH,
+      });
+    }
+    svg.addEventListener("wheel", onWheel, { passive: false });
+    return () => svg.removeEventListener("wheel", onWheel);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [naturalWidth, naturalHeight]);
 
   const isDragging = useRef(false);
   const dragMoved = useRef(false);
@@ -201,8 +232,6 @@ export function BranchGraph({ graph, repoUrl }: Props) {
   }
 
   const fitPct = Math.round((naturalWidth / view.w) * 100);
-  const selectedCommit =
-    selectedSha != null ? commits.find((c) => c.sha === selectedSha) ?? null : null;
   const hoveredCommit =
     hoveredSha != null ? commits.find((c) => c.sha === hoveredSha) ?? null : null;
 
@@ -216,7 +245,6 @@ export function BranchGraph({ graph, repoUrl }: Props) {
         viewBox={`${view.x} ${view.y} ${view.w} ${view.h}`}
         preserveAspectRatio="xMidYMid meet"
         className="block h-full w-full select-none"
-        onWheel={handleWheel}
         onMouseDown={handleMouseDown}
         onMouseMove={handleMouseMove}
         onMouseUp={handleMouseUp}
@@ -281,31 +309,17 @@ export function BranchGraph({ graph, repoUrl }: Props) {
         {/* Commit nodes */}
         {commits.map((c) => {
           const isHover = c.sha === hoveredSha;
-          const isSelected = c.sha === selectedSha;
           return (
-            <g key={c.sha}>
-              {isSelected && (
-                <circle
-                  cx={commitX(c.row)}
-                  cy={laneY(c.lane)}
-                  r={NODE_RADIUS + 5}
-                  fill="none"
-                  stroke={c.color}
-                  strokeWidth={2}
-                  opacity={0.7}
-                  vectorEffect="non-scaling-stroke"
-                />
-              )}
-              <circle
-                cx={commitX(c.row)}
-                cy={laneY(c.lane)}
-                r={isHover || isSelected ? NODE_RADIUS + 1 : NODE_RADIUS}
-                fill={c.color}
-                stroke="#0d1117"
-                strokeWidth={2}
-                style={{ cursor: "pointer" }}
-              />
-            </g>
+            <circle
+              key={c.sha}
+              cx={commitX(c.row)}
+              cy={laneY(c.lane)}
+              r={isHover ? NODE_RADIUS + 1 : NODE_RADIUS}
+              fill={c.color}
+              stroke="#0d1117"
+              strokeWidth={2}
+              style={{ cursor: "pointer" }}
+            />
           );
         })}
       </svg>
@@ -340,80 +354,27 @@ export function BranchGraph({ graph, repoUrl }: Props) {
       </div>
 
       <div className="absolute bottom-3 left-3 z-10 rounded-md border border-border bg-bg/90 px-2 py-1 text-[10px] text-text-muted backdrop-blur">
-        scroll = zoom · drag = pan · click commit for details
+        scroll = zoom · drag = pan · click commit to open on GitHub
       </div>
 
-      {/* Hover tooltip */}
-      {tooltip && hoveredCommit && !selectedCommit && (
+      {/* Hover tooltip — the only on-graph detail surface */}
+      {tooltip && hoveredCommit && (
         <FloatingCard
           clientX={tooltip.x}
           clientY={tooltip.y}
           containerRef={containerRef}
         >
-          <div className="font-mono text-text-muted">
-            {hoveredCommit.sha.slice(0, 7)}
+          <div className="flex items-center justify-between gap-2 font-mono text-text-muted">
+            <span>{hoveredCommit.sha.slice(0, 7)}</span>
+            <span>{formatDate(hoveredCommit.date)}</span>
           </div>
           <div className="mt-0.5 line-clamp-2 text-text">
             {hoveredCommit.message}
           </div>
+          <div className="mt-0.5 text-text-muted">
+            {hoveredCommit.authorLogin || hoveredCommit.authorName}
+          </div>
         </FloatingCard>
-      )}
-
-      {/* Click-to-pin detail panel */}
-      {selectedCommit && (
-        <div className="absolute right-3 top-3 z-20 w-80 rounded-md border border-border bg-bg/95 p-3 text-xs shadow-xl backdrop-blur">
-          <div className="flex items-start justify-between gap-2">
-            <span
-              className="inline-flex items-center gap-1.5 font-mono"
-              style={{ color: selectedCommit.color }}
-            >
-              <span
-                className="inline-block h-2 w-2 rounded-full"
-                style={{ background: selectedCommit.color }}
-              />
-              {selectedCommit.sha.slice(0, 7)}
-            </span>
-            <button
-              onClick={() => setSelectedSha(null)}
-              className="text-text-muted hover:text-text"
-              aria-label="Close"
-            >
-              ✕
-            </button>
-          </div>
-          <div className="mt-2 whitespace-pre-wrap text-text">
-            {selectedCommit.message}
-          </div>
-          <div className="mt-2 text-text-muted">
-            {selectedCommit.authorLogin || selectedCommit.authorName} ·{" "}
-            {formatDate(selectedCommit.date)}
-          </div>
-          {selectedCommit.branches.length > 0 && (
-            <div className="mt-2 flex flex-wrap gap-1">
-              {selectedCommit.branches.slice(0, 6).map((b) => (
-                <span
-                  key={b}
-                  className="rounded border border-border bg-bg-soft px-1.5 py-0.5 font-mono"
-                >
-                  {b}
-                </span>
-              ))}
-              {selectedCommit.branches.length > 6 && (
-                <span className="text-text-muted">
-                  +{selectedCommit.branches.length - 6} more
-                </span>
-              )}
-            </div>
-          )}
-          <a
-            href={`${repoUrl}/commit/${selectedCommit.sha}`}
-            target="_blank"
-            rel="noreferrer"
-            className="mt-3 inline-block text-accent hover:underline"
-          >
-            View on GitHub ↗
-          </a>
-        </div>
       )}
     </div>
   );
